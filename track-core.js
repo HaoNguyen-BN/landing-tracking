@@ -1,12 +1,13 @@
 /* ============================================================
    TRACK-CORE.JS — Bắt _fbp/_fbc, tạo Email ảo, chuẩn hóa SĐT,
-   đẩy dữ liệu đơn hàng sang Poscake (kèm tracking blob trong note)
+   gửi thẳng dữ liệu lead về Google Apps Script để GAS tự tạo đơn
+   trên Pancake POS (không qua n8n).
    Yêu cầu: window.LANDING_CONFIG phải được khai báo TRƯỚC script này.
    ============================================================ */
 (function () {
   "use strict";
   var CFG = window.LANDING_CONFIG || {};
-  if (!CFG.WEBHOOK_URL) { console.warn("[TRACK] Thiếu LANDING_CONFIG.WEBHOOK_URL"); return; }
+  if (!CFG.GAS_WEBHOOK_URL) { console.warn("[TRACK] Thiếu LANDING_CONFIG.GAS_WEBHOOK_URL"); return; }
 
   // ---------- Helpers ----------
   function getCookie(name) {
@@ -68,22 +69,23 @@
     return "";
   }
 
+  // Trả về cả product VÀ key của nó (option_1/option_2...) — key này GAS cần để tra
+  // đúng product_id/variation_id thật trên Pancake.
   function pickProduct(form) {
     var selected = form.querySelector("input[type=radio]:checked, input[type=checkbox]:checked, select");
-    var key = selected ? (selected.value || selected.getAttribute("data-option") || "") : "";
+    var key = (selected ? (selected.value || selected.getAttribute("data-option")) : "") || "option_1";
     var product = (CFG.PRODUCTS && (CFG.PRODUCTS[key] || CFG.PRODUCTS.option_1)) || {};
-    return product;
+    return { key: key, product: product };
   }
 
-  function sendToWebhook(payload) {
-    var headers = { "Content-Type": "application/json" };
-    if (CFG.WEBHOOK_AUTH && CFG.WEBHOOK_AUTH.username) {
-      headers["Authorization"] = "Basic " + btoa(CFG.WEBHOOK_AUTH.username + ":" + CFG.WEBHOOK_AUTH.password);
-    }
+  // QUAN TRỌNG: dùng Content-Type: text/plain để fetch() không kích hoạt CORS preflight
+  // (Google Apps Script Web App không xử lý được request OPTIONS preflight).
+  // GAS vẫn parse được JSON bình thường vì nó tự JSON.parse(e.postData.contents).
+  function sendToGas(payload) {
     try {
-      fetch(CFG.WEBHOOK_URL, {
+      fetch(CFG.GAS_WEBHOOK_URL, {
         method: "POST",
-        headers: headers,
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify(payload),
         keepalive: true
       }).catch(function (err) { console.warn("[TRACK] fetch lỗi", err); });
@@ -98,37 +100,27 @@
     var phone = normalizePhone(rawPhone, CFG.COUNTRY_CALLING_CODE);
     var email = buildVirtualEmail(phone);
     var externalId = uuidv4();
-    var product = pickProduct(form);
+    var picked = pickProduct(form);
+    var product = picked.product;
 
-    // Blob tracking sẽ được nhét vào field "note" khi tạo đơn trên Poscake,
-    // để khi Poscake bắn Webhook đổi trạng thái, GAS lấy lại được nguyên vẹn.
-    var trackingBlob = {
+    var payload = {
+      _source: "landing_form",
+      _secret: CFG.FORM_SECRET || "",
+      option_key: picked.key,
+      customer_name: name,
+      phone: phone,
+      email: email,
       external_id: externalId,
       fbp: getFbp(),
       fbc: getFbc(),
-      email: email,
-      phone: phone,
       currency: CFG.CURRENCY,
       value: product.price || 0,
       content_id: product.content_id || "",
       sku: product.sku || "",
-      user_agent: navigator.userAgent,
       source_url: window.location.href
     };
 
-    var payload = {
-      customer_name: name,
-      phone: phone,
-      product_name: product.name || "",
-      sku: product.sku || "",
-      quantity: product.quantity || 1,
-      price: product.price || 0,
-      content_id: product.content_id || "",
-      currency: CFG.CURRENCY,
-      note: "TRACKING::" + JSON.stringify(trackingBlob)
-    };
-
-    sendToWebhook(payload);
+    sendToGas(payload);
 
     try { sessionStorage.setItem("track_last_external_id", externalId); } catch (e) {}
   }
